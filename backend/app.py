@@ -4,11 +4,12 @@ from flask import Flask, request, jsonify
 from wiki_source import ENCODING, WikiSource, num_tokens_from_string
 from flask_cors import CORS
 import time
+import os
 
 app = Flask(__name__)
 CORS(app)
-openai_client = openai.OpenAI(api_key="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")
-MONGO_URI = "mongodb+srv://advaitishwar:JukesKappa123$56@cluster0.yhoks.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MONGO_URI = os.getenv("MONGO_URI")
 
 BATCH_SIZE = 1000
 FLAG_THRESHOLD = -0.5
