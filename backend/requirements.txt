@@ -5,3 +5,6 @@ openai
 flask
 pymongo
 flask-cors
+os
+python-dotenv
+pinecone

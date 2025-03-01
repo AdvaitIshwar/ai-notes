@@ -3,65 +3,90 @@ import pymongo
 from flask import Flask, request, jsonify
 from wiki_source import ENCODING, WikiSource, num_tokens_from_string
 from flask_cors import CORS
-import time
 import os
+from dotenv import load_dotenv
+from pinecone import Pinecone, ServerlessSpec
+import uuid
+from bson import ObjectId
+
+load_dotenv(dotenv_path=".env")
 
 app = Flask(__name__)
 CORS(app)
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+mongo_client = pymongo.MongoClient(MONGO_URI)
+
+# Initialize Pinecone
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = "smart-notes"
+
+# Check if index exists, if not create it
+if index not in pc.list_indexes().names():
+    pc.create_index(
+        name=index,
+        dimension=1536,
+        metric="cosine",
+        spec=ServerlessSpec(
+            cloud="aws",
+            region="us-east-1"
+        )
+    )
+
+# Connect to the index
+index = pc.Index(index)
 
 BATCH_SIZE = 1000
 FLAG_THRESHOLD = -0.5
 EMBEDDING_MODEL = "text-embedding-3-small"
 
-mongo_client = pymongo.MongoClient(MONGO_URI)
 db = mongo_client["smart_notes"]
 notes_collection = db["notes"]
-sources_collection = db["sources"]
 notebook_collection = db["notebooks"]
 
 """
-Example MongoDB Collection Structure:
+MongoDB Schema:
 notebook_document = {
     "_id": ObjectId(),
     "name": "Research Notes",
-    "note_ids": [ObjectId("note1_id"), ObjectId("note2_id")],
-    "source_id": ObjectId("source1_id")
+    "notes": [ObjectId("note1_id"), ObjectId("note2_id")],
+    "category_page": "Category:Artificial_intelligence"
 }
 
 note_document = {
     "_id": ObjectId(),
     "content": "This is a note about...",
     "notebook_id": ObjectId("notebook1_id"),
-    "embedding": [0.1, 0.2, 0.3],
+    "vector_id": "unique_vector_id",  # Reference to Pinecone vector
     "contradicting_info": [
         {
             "text": "This is contradicting information",
-            "score": 0.5
+            "score": 0.5,
+            "wikipedia_link": "https://..."
         }
     ]
 }
 
-source_document = {
-    "_id": ObjectId(),
-    "name": "Research Paper Title",
-    "strings": [
-        "This is a string about...",
-        "This is another string about..."
-    ],
-    "embeddings": [
-        [0.1, 0.2, 0.3],
-        [0.4, 0.5, 0.6]
-    ],
-    "link": "some wikipedia link"
+Pinecone Schema:
+{
+    "id": "unique_vector_id",
+    "values": [embedding vector],
+    "metadata": {
+        "text": "Original text content",
+        "type": "note/source",
+        "wikipedia_link": "https://..." (for source vectors),
+        "notebook_id": "notebook_id" (for organizing vectors by notebook)
+    }
 }
 """
 
 def generate_embedding(text):
-    return openai.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
+    return openai_client.embeddings.create(input=[text], model=EMBEDDING_MODEL).data[0].embedding
 
-def embed_wiki_source(category_page: str):
+def embed_wiki_source(category_page: str, notebook_id: str):
     parser = WikiSource(category_page)
     titles = parser.titles_from_category(parser.get_category_page(), max_depth=1)
     print(f"Found {len(titles)} article titles in {category_page}.")
@@ -80,71 +105,78 @@ def embed_wiki_source(category_page: str):
     for section in wikipedia_sections:
         wikipedia_strings.extend(parser.split_strings_from_subsection(section, max_tokens=1600))
     
-    tokens_per_string = [num_tokens_from_string(string, ENCODING) for string in wikipedia_strings]
-
     print(f"{len(wikipedia_sections)} Wikipedia sections split into {len(wikipedia_strings)} strings.")
-    print(f"Total tokens: {parser.total_tokens}")
 
-    embeddings = []
+    # Process in batches
+    vectors_to_upsert = []
     for batch_start in range(0, len(wikipedia_strings), BATCH_SIZE):
         batch_end = batch_start + BATCH_SIZE
         batch = wikipedia_strings[batch_start:batch_end]
-        print(f"Batch {batch_start} to {batch_end-1}")
+        print(f"Processing batch {batch_start} to {batch_end-1}")
+        
         response = openai_client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
-        for i, be in enumerate(response.data):
-            assert i == be.index  # double check embeddings are in same order as input
         batch_embeddings = [e.embedding for e in response.data]
-        embeddings.extend(batch_embeddings)
-
-    return (wikipedia_strings, embeddings)
-
-def flag_incorrect_info(query: str):
-    # Generate embedding for query
-    query_embedding = generate_embedding(query)
-    
-    sources_collection.create_search_index(
-    {"definition":
-        {"mappings": {"dynamic": True, "fields": {
-            "embeddings" : {
-                "dimensions": 1536,
-                "similarity": "dotProduct",
-                "type": "knnVector"
-                }}}},
-     "name": "source_embeddings_index",
-    })
-
-    results = sources_collection.aggregate([
-    {
-        '$vectorSearch': {
-            "index": "source_embeddings_index",
-            "path": "embeddings",
-            "queryVector": query_embedding,
-            "numCandidates": 50,
-            "limit": 5,
-        }
-    },
-    { "$sort": { "score": 1 } }
-    ])
-
-    flagged_sources = []
-    for doc in results:
-        if doc["score"] < FLAG_THRESHOLD:
-            flagged_sources.append({
-                "text": doc["text"],
-                "score": doc["score"],
-                "wikipedia_link": doc["link"]
+        
+        # Prepare vectors for Pinecone
+        for text, embedding in zip(batch, batch_embeddings):
+            vector_id = str(uuid.uuid4())
+            vectors_to_upsert.append({
+                "id": vector_id,
+                "values": embedding,
+                "metadata": {
+                    "text": text,
+                    "type": "source",
+                    "notebook_id": notebook_id,
+                    "wikipedia_link": f"https://en.wikipedia.org/wiki/{category_page}"
+                }
             })
     
-    return {"flagged_sources": flagged_sources}
+    # Upsert to Pinecone in smaller batches
+    PINECONE_BATCH_SIZE = 100
+    for i in range(0, len(vectors_to_upsert), PINECONE_BATCH_SIZE):
+        batch = vectors_to_upsert[i:i + PINECONE_BATCH_SIZE]
+        index.upsert(vectors=batch)
+
+def flag_incorrect_info(query: str, query_embedding, notebook_id: str):
+    negative_query_embedding = [-x for x in query_embedding]
+    
+    results = index.query(
+        vector=negative_query_embedding,
+        filter={
+            "type": "source",
+            "notebook_id": notebook_id
+        },
+        top_k=5,
+        include_metadata=True
+    )
+    
+    flagged_sources = []
+    for match in results.matches:
+        actual_similarity = -match.score
+        flagged_sources.append({
+            "text": match.metadata["text"],
+            "score": actual_similarity,
+            "wikipedia_link": match.metadata["wikipedia_link"]
+        })
+    
+    return flagged_sources
 
 @app.route("/create_notebook", methods=["POST"])
 def create_notebook():
     data = request.json
     notebook_name = data["notebook_name"]
     category_page = data["category_page"]
-    wiki_strings, embeddings = embed_wiki_source(category_page)
-    notebook_collection.insert_one({"name": notebook_name, "notes": [], "source": {"strings": wiki_strings, "embeddings": embeddings}})
-    return jsonify({"message": "Notebook created successfully!"})
+    
+    result = notebook_collection.insert_one({
+        "name": notebook_name,
+        "notes": [],
+        "category_page": category_page
+    })
+    notebook_id = str(result.inserted_id)
+    
+    embed_wiki_source(category_page, notebook_id)
+    
+    return jsonify({"message": "Notebook created successfully!", "notebook_id": notebook_id})
 
 @app.route("/add_note", methods=["POST"])
 def add_note():
@@ -153,108 +185,113 @@ def add_note():
     note_text = data["note"]
     
     embedding = generate_embedding(note_text)
+    vector_id = str(uuid.uuid4())
     
-    contradicting_info = flag_incorrect_info(note_text)
-
-    notes_collection.insert_one({
+    index.upsert(
+        vectors=[{
+            "id": vector_id,
+            "values": embedding,
+            "metadata": {
+                "text": note_text,
+                "type": "note",
+                "notebook_id": notebook_id
+            }
+        }]
+    )
+    
+    contradicting_info = flag_incorrect_info(note_text, embedding, notebook_id)
+    
+    note = {
         "content": note_text,
-        "embedding": embedding,
+        "vector_id": vector_id,
         "notebook_id": notebook_id,
         "contradicting_info": contradicting_info
-    })
-
-    note_id = notes_collection.find_one({"content": note_text})["_id"]
+    }
+    result = notes_collection.insert_one(note)
+    
     notebook_collection.update_one(
-        {"_id": notebook_id},
-        {"$push": {"notes": note_id}}
+        {"_id": ObjectId(notebook_id)},
+        {"$push": {"notes": result.inserted_id}}
     )
     
     return jsonify({"message": "Note saved successfully!"})
 
 @app.route("/get_all_notebooks", methods=["GET"])
 def get_all_notebooks():
-    notebooks = notebook_collection.find()
-    return jsonify([{"id": str(notebook["_id"]), "name": notebook["name"]} for notebook in notebooks])
-
-@app.route("/get_notes_for_notebook", methods=["GET"])
-def get_notes_for_notebook():
-    notebook_id = request.args.get("notebook_id")
-    return jsonify([{"id": str(note["_id"]), "content": note["content"]} for note in notes_collection.find({"notebook_id": notebook_id})])
+    notebooks = list(notebook_collection.find())
+    response = []
+    
+    for notebook in notebooks:
+        # Get all notes for this notebook
+        notebook_notes = list(notes_collection.find({"notebook_id": str(notebook["_id"])}))
+        response.append({
+            "id": str(notebook["_id"]),
+            "name": notebook["name"],
+            "notes": [{
+                "id": str(note["_id"]),
+                "content": note["content"],
+                "contradicting_info": note.get("contradicting_info", [])
+            } for note in notebook_notes]
+        })
+    
+    return jsonify(response)
 
 @app.route("/get_note", methods=["GET"])
 def get_note():
     note_id = request.args.get("note_id")
-    return jsonify(notes_collection.find_one({"_id": note_id}))
+    note = notes_collection.find_one({"_id": ObjectId(note_id)})
+    if note:
+        return jsonify({
+            "id": str(note["_id"]),
+            "content": note["content"],
+            "contradicting_info": note["contradicting_info"]
+        })
+    return jsonify({"error": "Note not found"}), 404
 
-@app.route("/update_note", methods=["PUT"])
-def update_note():
-    data = request.json
-    note_id = data["note_id"]
-    note_text = data["note"]
-    
-    embedding = generate_embedding(note_text)
-    
-    notes_collection.replace_one({"_id": note_id}, {"text": note_text, "embedding": embedding})
-    
-    return jsonify({"message": "Note saved successfully!"})
+@app.route("/get_notes", methods=["GET"])
+def get_notes():
+    notebook_id = request.args.get("notebook_id")
+    notes = notes_collection.find({"notebook_id": notebook_id})
+    return jsonify([{
+        "id": str(note["_id"]),
+        "content": note["content"],
+        "contradicting_info": note["contradicting_info"]
+    } for note in notes])
+
 
 @app.route("/learn_more", methods=["GET"])
 def learn_more():
     note_id = request.args.get("note_id")
     note = notes_collection.find_one({"_id": note_id})
     
-    # Create index on source embeddings array
-    sources_collection.create_search_index(
-    {"definition":
-        {"mappings": {"dynamic": True, "fields": {
-            "embeddings" : {
-                "dimensions": 1536,
-                "similarity": "dotProduct",
-                "type": "knnVector"
-                }}}},
-     "name": "source_embeddings_index",
-    })
-
-    results = sources_collection.aggregate([
-    {
-        '$vectorSearch': {
-            "index": "source_embeddings_index",
-            "path": "embeddings",
-            "queryVector": note["embedding"],
-            "numCandidates": 50,
-            "limit": 5,
-        }
-    },
-    {
-        # Project to get the corresponding string and link for each matching embedding
-        '$project': {
-            'string': {
-                '$arrayElemAt': [
-                    '$strings',
-                    {
-                        '$indexOfArray': ['$embeddings', '$vectorSearchScore.embedding']
-                    }
-                ]
-            },
-            'link': 1,  # Include the Wikipedia link
-            'name': 1,  # Include the source name
-            'score': '$vectorSearchScore'
-        }
-    }
-    ])
+    if not note:
+        return jsonify({"error": "Note not found"}), 404
     
-    # Format results for response
+    vector = index.fetch([note["vector_id"]])
+    if not vector.vectors:
+        return jsonify({"error": "Vector not found"}), 404
+    
+    results = index.query(
+        vector=vector.vectors[note["vector_id"]].values,
+        filter={
+            "type": "source",
+            "notebook_id": note["notebook_id"]
+        },
+        top_k=5,
+        include_metadata=True
+    )
+    
     formatted_results = []
-    for result in results:
+    for match in results.matches:
         formatted_results.append({
-            "text": result["string"],
-            "source_name": result["name"],
-            "wikipedia_link": result["link"],
-            "score": result["score"]
+            "string": match.metadata["text"],
+            "name": "Wikipedia",
+            "link": match.metadata["wikipedia_link"],
+            "score": match.score
         })
     
-    return jsonify({
-        "results": formatted_results,
-    })
+    return jsonify({"results": formatted_results})
 
-app.run(debug=True)
+
+if __name__ == "__main__":
+    app.run(debug=True)
