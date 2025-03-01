@@ -1,0 +1,7 @@
+tiktoken
+mwclient
+mwparserfromhell
+openai
+flask
+pymongo
+flask-cors
