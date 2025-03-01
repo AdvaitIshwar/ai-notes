@@ -262,7 +262,7 @@ def get_notes():
 @app.route("/learn_more", methods=["GET"])
 def learn_more():
     note_id = request.args.get("note_id")
-    note = notes_collection.find_one({"_id": note_id})
+    note = notes_collection.find_one({"_id": ObjectId(note_id)})
     
     if not note:
         return jsonify({"error": "Note not found"}), 404
