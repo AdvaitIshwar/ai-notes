@@ -4,7 +4,7 @@ import axios from "axios";
 interface Note {
   content: string;
   id: string;
-  contradicting_info?: ContradictingInfo[];
+  related_info: RelatedInfo[];
 }
 
 interface Notebook {
@@ -13,17 +13,10 @@ interface Notebook {
   notes: Note[];
 }
 
-interface ContradictingInfo {
+interface RelatedInfo {
   text: string;
   score: string;
   wikipedia_link: string;
-}
-
-interface RelatedInfo {
-  string: string;
-  name: string;
-  link: string;
-  score: number;
 }
 
 export default function NotebooksLayout() {
@@ -34,7 +27,7 @@ export default function NotebooksLayout() {
   const [isCreatingNotebook, setIsCreatingNotebook] = useState(false);
   const [newNotebookName, setNewNotebookName] = useState("");
   const [categoryPage, setCategoryPage] = useState("");
-  const [relatedInfo, setRelatedInfo] = useState<RelatedInfo[]>([]);
+  const [gptResponse, setGPTResponse] = useState("");
   const [isCreatingNote, setIsCreatingNote] = useState(false);
   const [newNoteContent, setNewNoteContent] = useState("");
   const [isLoadingNote, setIsLoadingNote] = useState(false);
@@ -117,13 +110,12 @@ export default function NotebooksLayout() {
     }
   };
 
-  const learnMore = async (noteId: string) => {
+  const checkNote = async (noteId: string) => {
     try {
       const response = await axios.get(
-        `http://127.0.0.1:5000/learn_more?note_id=${noteId}`
+        `http://127.0.0.1:5000/resolve_potential_misinformation?note_id=${noteId}`
       );
-      setRelatedInfo(response.data.results);
-      console.log(response.data.results);
+      setGPTResponse(response.data.response);
     } catch (error) {
       console.error("Error fetching related info:", error);
     }
@@ -133,13 +125,13 @@ export default function NotebooksLayout() {
   const backToNotebooks = () => {
     setSelectedNotebook(null);
     setSelectedNote(null);
-    setRelatedInfo([]);
+    setGPTResponse("");
   };
 
   // Function to go back to notes view
   const backToNotes = () => {
     setSelectedNote(null);
-    setRelatedInfo([]);
+    setGPTResponse("");
   };
 
   // Render notebooks grid on main screen
@@ -218,7 +210,6 @@ export default function NotebooksLayout() {
   // Render selected note with its details
   const renderNoteDetail = () => {
     if (!selectedNote) return null;
-
     return (
       <div className="p-8">
         <div className="flex items-center mb-8">
@@ -235,71 +226,59 @@ export default function NotebooksLayout() {
           <p className="text-lg">{selectedNote.content}</p>
         </div>
 
-        {selectedNote.contradicting_info &&
-          selectedNote.contradicting_info.length > 0 && (
-            <div className="bg-yellow-50 border-yellow-200 border rounded-lg p-6 mb-6">
-              <h3 className="text-yellow-800 font-medium mb-4">
-                Contradicting Information
-              </h3>
-              <div className="space-y-4">
-                {selectedNote.contradicting_info.map((info, index) => (
-                  <div key={index} className="flex items-start">
-                    <div className="flex-1">
-                      <p className="text-yellow-700">{info.text}</p>
-                      <p className="text-yellow-600 text-sm mt-1">
-                        Confidence Score: {info.score}
-                      </p>
-                    </div>
-                    <a
-                      href={info.wikipedia_link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="ml-4 text-blue-600 hover:text-blue-800"
-                    >
-                      View Source
-                    </a>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-        {relatedInfo.length > 0 ? (
-          <div className="bg-gray-50 border border-gray-200 rounded-lg p-6">
-            <h3 className="text-lg font-medium mb-4">Related Information</h3>
+        {selectedNote.related_info && selectedNote.related_info.length > 0 && (
+          <div className="bg-yellow-50 border-yellow-200 border rounded-lg p-6 mb-6">
+            <h3 className="text-yellow-800 font-medium mb-4">
+              Related Information
+            </h3>
             <div className="space-y-4">
-              {relatedInfo.map((info, index) => (
-                <div
-                  key={index}
-                  className="bg-white rounded-lg p-4 border border-gray-100"
-                >
-                  <p className="text-gray-800">{info.string}</p>
-                  <div className="mt-2 flex justify-between items-center">
-                    <span className="text-sm text-gray-600">{info.name}</span>
-                    <a
-                      href={info.link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-600 hover:text-blue-800 text-sm"
-                    >
-                      View Source
-                    </a>
+              {selectedNote.related_info.map((info, index) => (
+                <div key={index} className="flex items-start">
+                  <div className="flex-1">
+                    <p className="text-yellow-700">{info.text}</p>
+                    <p className="text-yellow-600 text-sm mt-1">
+                      Confidence Score: {info.score}
+                    </p>
                   </div>
+                  <a
+                    href={info.wikipedia_link}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="ml-4 text-blue-600 hover:text-blue-800"
+                  >
+                    View Source
+                  </a>
                 </div>
               ))}
             </div>
           </div>
-        ) : (
-          <div className="text-center">
-            <button
-              onClick={() => learnMore(selectedNote.id)}
-              disabled={isLoadingNote}
-              className="bg-blue-600 text-white px-6 py-3 rounded-md hover:bg-blue-700 disabled:bg-blue-400"
-            >
-              {isLoadingNote ? "Loading..." : "Learn More"}
-            </button>
-          </div>
         )}
+
+        {selectedNote.related_info &&
+          selectedNote.related_info.length > 0 &&
+          Math.max(
+            ...selectedNote.related_info.map((info) => parseFloat(info.score))
+          ) < 0.75 && (
+            <div className="mt-6">
+              {gptResponse !== "" ? (
+                <div className="bg-blue-50 border-blue-200 border rounded-lg p-6 mb-6">
+                  <h3 className="text-blue-800 font-medium mb-4">
+                    Corrected Note
+                  </h3>
+                  <p className="text-blue-800 mb-4">{gptResponse}</p>
+                </div>
+              ) : (
+                <button
+                  onClick={async () => {
+                    checkNote(selectedNote.id);
+                  }}
+                  className="bg-yellow-600 text-white px-4 py-2 rounded hover:bg-yellow-700"
+                >
+                  Check and Fix Note Accuracy
+                </button>
+              )}
+            </div>
+          )}
       </div>
     );
   };
@@ -339,23 +318,6 @@ export default function NotebooksLayout() {
                     className="bg-secondary/50 hover:bg-secondary text-secondary-foreground p-4 rounded-lg w-full text-left transition-colors"
                   >
                     <p className="line-clamp-3 text-sm">{note.content}</p>
-                    {note.contradicting_info &&
-                      note.contradicting_info.length > 0 && (
-                        <div className="flex items-center mt-2 text-yellow-500 text-xs">
-                          <svg
-                            className="h-4 w-4 mr-1"
-                            fill="currentColor"
-                            viewBox="0 0 20 20"
-                          >
-                            <path
-                              fillRule="evenodd"
-                              d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
-                              clipRule="evenodd"
-                            />
-                          </svg>
-                          Contradictions found
-                        </div>
-                      )}
                   </button>
                 ))}
             </div>
@@ -434,9 +396,6 @@ export default function NotebooksLayout() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium mb-2">
-                Note Content
-              </label>
               <textarea
                 placeholder="Enter your note..."
                 value={newNoteContent}

@@ -40,8 +40,9 @@ if index not in pc.list_indexes().names():
 index = pc.Index(index)
 
 BATCH_SIZE = 1000
-FLAG_THRESHOLD = -0.5
+THRESHOLD = 0.75
 EMBEDDING_MODEL = "text-embedding-3-small"
+GPT_MODEL = "gpt-4o-mini"
 
 db = mongo_client["smart_notes"]
 notes_collection = db["notes"]
@@ -61,7 +62,7 @@ note_document = {
     "content": "This is a note about...",
     "notebook_id": ObjectId("notebook1_id"),
     "vector_id": "unique_vector_id",  # Reference to Pinecone vector
-    "contradicting_info": [
+    "related_info": [
         {
             "text": "This is contradicting information",
             "score": 0.5,
@@ -137,30 +138,6 @@ def embed_wiki_source(category_page: str, notebook_id: str):
         batch = vectors_to_upsert[i:i + PINECONE_BATCH_SIZE]
         index.upsert(vectors=batch)
 
-def flag_incorrect_info(query: str, query_embedding, notebook_id: str):
-    negative_query_embedding = [-x for x in query_embedding]
-    
-    results = index.query(
-        vector=negative_query_embedding,
-        filter={
-            "type": "source",
-            "notebook_id": notebook_id
-        },
-        top_k=5,
-        include_metadata=True
-    )
-    
-    flagged_sources = []
-    for match in results.matches:
-        actual_similarity = -match.score
-        flagged_sources.append({
-            "text": match.metadata["text"],
-            "score": actual_similarity,
-            "wikipedia_link": match.metadata["wikipedia_link"]
-        })
-    
-    return flagged_sources
-
 @app.route("/create_notebook", methods=["POST"])
 def create_notebook():
     data = request.json
@@ -177,6 +154,23 @@ def create_notebook():
     embed_wiki_source(category_page, notebook_id)
     
     return jsonify({"message": "Notebook created successfully!", "notebook_id": notebook_id})
+
+def get_related_info(query_embedding: list[float]):
+    results = index.query(
+        vector=query_embedding,
+        filter={"type": "source"},
+        top_k=3,
+        include_metadata=True
+    )
+    related_info = []
+    for match in results.matches:
+        related_info.append({
+            "text": match.metadata["text"],
+            "score": match.score,
+            "wikipedia_link": match.metadata["wikipedia_link"]
+        })
+    
+    return related_info
 
 @app.route("/add_note", methods=["POST"])
 def add_note():
@@ -198,14 +192,14 @@ def add_note():
             }
         }]
     )
-    
-    contradicting_info = flag_incorrect_info(note_text, embedding, notebook_id)
+
+    related_info = get_related_info(embedding)
     
     note = {
         "content": note_text,
         "vector_id": vector_id,
         "notebook_id": notebook_id,
-        "contradicting_info": contradicting_info
+        "related_info": related_info
     }
     result = notes_collection.insert_one(note)
     
@@ -230,7 +224,7 @@ def get_all_notebooks():
             "notes": [{
                 "id": str(note["_id"]),
                 "content": note["content"],
-                "contradicting_info": note.get("contradicting_info", [])
+                "related_info": note.get("related_info", [])
             } for note in notebook_notes]
         })
     
@@ -244,7 +238,7 @@ def get_note():
         return jsonify({
             "id": str(note["_id"]),
             "content": note["content"],
-            "contradicting_info": note["contradicting_info"]
+            "related_info": note["related_info"]
         })
     return jsonify({"error": "Note not found"}), 404
 
@@ -255,12 +249,11 @@ def get_notes():
     return jsonify([{
         "id": str(note["_id"]),
         "content": note["content"],
-        "contradicting_info": note["contradicting_info"]
+        "related_info": note["related_info"]
     } for note in notes])
 
-
-@app.route("/learn_more", methods=["GET"])
-def learn_more():
+@app.route("/resolve_potential_misinformation", methods=["GET"])
+def resolve_potential_misinformation():
     note_id = request.args.get("note_id")
     note = notes_collection.find_one({"_id": ObjectId(note_id)})
     
@@ -271,26 +264,42 @@ def learn_more():
     if not vector.vectors:
         return jsonify({"error": "Vector not found"}), 404
     
-    results = index.query(
-        vector=vector.vectors[note["vector_id"]].values,
-        filter={
-            "type": "source",
-            "notebook_id": note["notebook_id"]
-        },
-        top_k=5,
-        include_metadata=True
+    top_related_info = note["related_info"]
+    top_related_info_scores = [info["score"] for info in top_related_info]
+    if max(top_related_info_scores) < THRESHOLD:
+        top_related_info_string = "\n\n".join([f"Source {i+1}:\n{info['text']}" for i, info in enumerate(top_related_info)])
+        print(top_related_info_string)
+    else:
+        return jsonify({"message": "No potential misinformation found"})
+    
+    prompt = f"""
+    Given a statement, and a list of related information that are considered to be factual,
+    determine if the statement is factually inaccurate.
+    If it is, correct the statement to be factually accurate and print out the corrected statement in the following format: "Corrected statement: <statement>".
+    Please also print which of the sources provided were used to correct the statement in the following format: 
+    "Sources used: <source1>, <source2>, <source3>".
+    If not print "Statement is factually accurate".
+    The statement is: {note["content"]}
+    The top 3 related information from Wikipedia are: {top_related_info_string}
+    """
+    
+    response = openai_client.chat.completions.create(
+        model=GPT_MODEL,
+        messages=[{"role": "system", "content": "You are a helpful assistant that resolves potential misinformation in a note."}, 
+                  {"role": "user", "content": prompt}]
     )
+
+    if "Corrected statement:" in response.choices[0].message.content:
+        corrected_statement = response.choices[0].message.content.replace("Corrected statement: ", "")
     
-    formatted_results = []
-    for match in results.matches:
-        formatted_results.append({
-            "string": match.metadata["text"],
-            "name": "Wikipedia",
-            "link": match.metadata["wikipedia_link"],
-            "score": match.score
-        })
+    return jsonify({"response": response.choices[0].message.content})
+
+@app.route("/delete_note", methods=["DELETE"])
+def delete_note():
+    note_id = request.args.get("note_id")
+    notes_collection.delete_one({"_id": ObjectId(note_id)})
+    return jsonify({"message": "Note deleted successfully!"})
     
-    return jsonify({"results": formatted_results})
 
 
 if __name__ == "__main__":
